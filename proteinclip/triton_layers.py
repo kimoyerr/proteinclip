@@ -1,6 +1,4 @@
 import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# os.environ['TRITON_INTERPRET'] = '1'
 
 import typing
 import torch
@@ -87,6 +85,9 @@ class TritonLinearAutograd(torch.autograd.Function):
             batch_dim, 
             in_feat_dim, 
             out_feat_dim,
+            *flattened_inputs.stride(),
+            *weights.stride(),
+            *outputs.stride(),
             fp16=outputs_dtype is torch.float16
         )
 
