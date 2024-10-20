@@ -1,13 +1,14 @@
 import numpy as np
 import triton
 import triton.language as tl
+import torch
 
 
-# def allow_tf32() -> bool:
-#     """
-#     Returns whether the current GPU architecture supports TF32.
-#     """
-#     return torch.cuda.get_device_capability()[0] >= 8
+def allow_tf32() -> bool:
+    """
+    Returns whether the current GPU architecture supports TF32.
+    """
+    return torch.cuda.get_device_capability()[0] >= 8
 
 
 # def get_n_stages(n_stages: int = 2) -> int:
@@ -63,7 +64,7 @@ import triton.language as tl
 #     ],
 #     key=['batch_dim', 'in_feat_dim', 'out_feat_dim', 'fp16'],
 # )
-# @triton.heuristics({'tf32': lambda _: allow_tf32()})
+@triton.heuristics({'tf32': lambda _: allow_tf32()})
 @triton.jit
 def triton_linear_forward_kernel(
     input_pointer,
@@ -78,22 +79,31 @@ def triton_linear_forward_kernel(
     weight_out_feat_stride,
     output_batch_stride,
     output_out_feat_stride, 
-    fp16: tl.constexpr, 
-    BLOCK_SIZE_BATCH:  tl.constexpr = 64,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
+    fp16: tl.constexpr, tf32: tl.constexpr,
+    BLOCK_SIZE_BATCH:  tl.constexpr = 128,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
     BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
     BLOCK_SIZE_OUT_FEAT: tl.constexpr = 128,
-    GROUP_SIZE_BATCH: tl.constexpr = 8,
+    GROUP_SIZE_BATCH: tl.constexpr = 32,
+    # Best for 320 input features
+    # BLOCK_SIZE_BATCH:  tl.constexpr = 128,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
+    # BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
+    # BLOCK_SIZE_OUT_FEAT: tl.constexpr = 128,
+    # GROUP_SIZE_BATCH: tl.constexpr = 32,
 ):
     # Print the loaded values
-    tl.device_print("Loaded values: ")
+    # tl.device_print("Loaded values: ")
     pid = tl.program_id(0)
     n_batch_pids = tl.cdiv(batch_dim, BLOCK_SIZE_BATCH)
-    # n_out_feat_pids = tl.cdiv(out_feat_dim, BLOCK_SIZE_OUT_FEAT)
-    n_batch_pids = np.math.ceil(batch_dim / BLOCK_SIZE_BATCH)
-    n_out_feat_pids = np.math.ceil(out_feat_dim / BLOCK_SIZE_OUT_FEAT)
+    n_out_feat_pids = tl.cdiv(out_feat_dim, BLOCK_SIZE_OUT_FEAT)
+    pids_per_group = GROUP_SIZE_BATCH * n_out_feat_pids
+    group_id = pid // GROUP_SIZE_BATCH
+    first_batch_pid = group_id * GROUP_SIZE_BATCH
+    GROUP_SIZE_BATCH = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)
+    batch_pid = first_batch_pid + (pid % GROUP_SIZE_BATCH)
+    out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_BATCH
 
-    batch_offset = pid*BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
-    out_feat_offset = pid*BLOCK_SIZE_OUT_FEAT + tl.arange(0, BLOCK_SIZE_OUT_FEAT)
+    batch_offset = batch_pid*BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
+    out_feat_offset = out_feat_pid*BLOCK_SIZE_OUT_FEAT + tl.arange(0, BLOCK_SIZE_OUT_FEAT)
 
     # Guide for the offsets
     batch_mask = batch_offset < batch_dim
@@ -104,20 +114,52 @@ def triton_linear_forward_kernel(
 
     accum = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_OUT_FEAT),
                      dtype=tl.float32)
-    # for inner_block_ind in range(0, tl.cdiv(in_feat_dim, BLOCK_SIZE_IN_FEAT)):
-    for inner_block_ind in range(0, np.math.ceil(in_feat_dim / BLOCK_SIZE_IN_FEAT)):
-        in_feat_offset = inner_block_ind*BLOCK_SIZE_IN_FEAT + tl.arange(0, BLOCK_SIZE_IN_FEAT)
+    for block_ind in range(0, tl.cdiv(in_feat_dim, BLOCK_SIZE_IN_FEAT)):
+        in_feat_offset = (block_ind * BLOCK_SIZE_IN_FEAT +
+                          tl.arange(0, BLOCK_SIZE_IN_FEAT))
         in_feat_mask = in_feat_offset < in_feat_dim
 
-        curr_input_pointer = input_pointer + input_in_feat_stride*in_feat_offset[None,:]
-        curr_weight_pointer = weight_pointer + weight_in_feat_stride*in_feat_offset[:, None]
+        curr_input_pointer = (input_pointer +
+                              input_in_feat_stride * in_feat_offset[None, :])
+        curr_weight_pointer = (weight_pointer +
+                               weight_in_feat_stride * in_feat_offset[:, None])
 
-        # Load input and weight
-        curr_input_block = tl.load(curr_input_pointer, mask=batch_mask[:, None] & in_feat_mask[None, :])
-        curr_weight_block = tl.load(curr_weight_pointer, mask=in_feat_mask[:, None] & out_feat_mask[None, :])
+        input_block = tl.load(curr_input_pointer,
+                              mask=batch_mask[:, None] & in_feat_mask[None, :])
+        weight_block = tl.load(curr_weight_pointer,
+                               mask=out_feat_mask[None, :] & in_feat_mask[:, None])
 
-        # Dot product
-        accum += tl.dot(curr_input_block, curr_weight_block, allow_tf32=True)
+        if fp16:
+            input_block = input_block.to(tl.float16)
+            weight_block = weight_block.to(tl.float16)
+
+        accum += tl.dot(input_block, weight_block, allow_tf32=tf32)
+
+    # if add_bias:
+    #     bias = tl.load(bias_pointer + out_feat_offset,
+    #                    mask=out_feat_mask)
+
+    #     if fp16:
+    #         bias = bias.to(tl.float16)
+
+    #     accum += bias[None, :]
+
+    # if act_func is not None:
+    #     if save_pre_act:
+    #         pre_act_pointer += (pre_act_batch_stride * batch_offset[:, None] +
+    #                             pre_act_out_feat_stride * out_feat_offset[None, :])
+    #         tl.store(pre_act_pointer, accum,
+    #                  mask=batch_mask[:, None] & out_feat_mask[None, :])
+
+    #     accum = apply_act_func(accum, None, None, None, param, act_func, False)
+
+    output_pointer += (output_batch_stride * batch_offset[:, None] +
+                       output_out_feat_stride * out_feat_offset[None, :])
+    tl.store(output_pointer, accum,
+             mask=batch_mask[:, None] & out_feat_mask[None, :])
+
+    print("Triton Kernel: Done")
+
 
 
 

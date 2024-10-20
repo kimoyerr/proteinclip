@@ -64,7 +64,7 @@ class TritonLinearAutograd(torch.autograd.Function):
         if weights is None:
             raise ValueError("Weights must be provided")
 
-        print(inputs.shape)
+        # print(inputs.shape)
 
         flattened_inputs = inputs.flatten(0, -2)
         batch_dim, in_feat_dim = flattened_inputs.shape
@@ -90,6 +90,15 @@ class TritonLinearAutograd(torch.autograd.Function):
             *outputs.stride(),
             fp16=outputs_dtype is torch.float16
         )
+        # ctx.param = param
+        output_dtype = "fp16"
+        ctx.act_func = act_func
+        ctx.bias_requires_grad = False if bias is None else bias.requires_grad
+        ctx.output_dtype = output_dtype
+        # if requires_grad:
+        #     ctx.save_for_backward(input, pre_act if save_pre_act else None, weight)
+
+        return outputs.view(*inputs.shape[:-1], out_feat_dim)
 
 
 class TritonLinearLayer(nn.Linear):
