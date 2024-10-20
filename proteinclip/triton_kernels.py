@@ -8,7 +8,8 @@ def allow_tf32() -> bool:
     """
     Returns whether the current GPU architecture supports TF32.
     """
-    return torch.cuda.get_device_capability()[0] >= 8
+    # return torch.cuda.get_device_capability()[0] >= 8
+    return False
 
 
 # def get_n_stages(n_stages: int = 2) -> int:
@@ -80,9 +81,9 @@ def triton_linear_forward_kernel(
     output_batch_stride,
     output_out_feat_stride, 
     fp16: tl.constexpr, tf32: tl.constexpr,
-    BLOCK_SIZE_BATCH:  tl.constexpr = 128,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
+    BLOCK_SIZE_BATCH:  tl.constexpr = 16,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
     BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
-    BLOCK_SIZE_OUT_FEAT: tl.constexpr = 128,
+    BLOCK_SIZE_OUT_FEAT: tl.constexpr = 32,
     GROUP_SIZE_BATCH: tl.constexpr = 32,
     # Best for 320 input features
     # BLOCK_SIZE_BATCH:  tl.constexpr = 128,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
@@ -95,12 +96,15 @@ def triton_linear_forward_kernel(
     pid = tl.program_id(0)
     n_batch_pids = tl.cdiv(batch_dim, BLOCK_SIZE_BATCH)
     n_out_feat_pids = tl.cdiv(out_feat_dim, BLOCK_SIZE_OUT_FEAT)
-    pids_per_group = GROUP_SIZE_BATCH * n_out_feat_pids
+    
+    # This code chunk groups batches and output features together for the tiled matrix multiplication: https://alvinwan.com/how-to-tile-matrix-multiplication
+    ## The batch_dimension moves faster than the output feature dimension
+    pids_per_group = GROUP_SIZE_BATCH * n_out_feat_pids  # Number of pids needed to cover all output features in a group. Example: If the output features are 128 and BLOCK_SIZE_OUT_FEAT is 32, and GROUP_SIZE_BATCH 4 is  then pids_per_group = 4*4 = 16
     group_id = pid // GROUP_SIZE_BATCH
     first_batch_pid = group_id * GROUP_SIZE_BATCH
-    GROUP_SIZE_BATCH = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)
+    GROUP_SIZE_BATCH = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)  # Last (or the only) group may have fewer pids than GROUP_SIZE_BATCH
     batch_pid = first_batch_pid + (pid % GROUP_SIZE_BATCH)
-    out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_BATCH
+    out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_BATCH  # Move to the next group of output features when all batches are covered
 
     batch_offset = batch_pid*BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
     out_feat_offset = out_feat_pid*BLOCK_SIZE_OUT_FEAT + tl.arange(0, BLOCK_SIZE_OUT_FEAT)
@@ -112,6 +116,8 @@ def triton_linear_forward_kernel(
     input_pointer += input_batch_stride*batch_offset[:, None]
     weight_pointer += weight_out_feat_stride*out_feat_offset[None, :]
 
+
+    # Run inner dimension loop for each block
     accum = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_OUT_FEAT),
                      dtype=tl.float32)
     for block_ind in range(0, tl.cdiv(in_feat_dim, BLOCK_SIZE_IN_FEAT)):
@@ -124,6 +130,7 @@ def triton_linear_forward_kernel(
         curr_weight_pointer = (weight_pointer +
                                weight_in_feat_stride * in_feat_offset[:, None])
 
+        # Load the input and weight blocks
         input_block = tl.load(curr_input_pointer,
                               mask=batch_mask[:, None] & in_feat_mask[None, :])
         weight_block = tl.load(curr_weight_pointer,

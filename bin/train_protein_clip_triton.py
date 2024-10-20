@@ -2,7 +2,6 @@
 import os
 
 # Triton debug options: Change to 1 to enable debugging and change to 0 to disable debugging
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['TRITON_INTERPRET'] = '1'
 # This has to be before importing triton
 ############################################################################################################################
@@ -15,12 +14,15 @@ import logging
 import torch
 from torch import nn
 from torch.utils import data
+import triton
 
 from proteinclip import data_utils
 
 # from proteinclip import data_utils, fasta_utils, swissprot, hparams
 from proteinclip import contrastive
 from proteinclip import triton_layers
+
+from torch.utils.tensorboard import SummaryWriter
 
 
 def write_split_identifiers(train_ids, valid_ids, test_ids, out_file):
@@ -144,7 +146,7 @@ else:
 dset_splits = [data.Subset(dset, idx) for idx in split_indices]
 
 # Create data loaders
-batch_size = 4
+batch_size = 96
 train_dl, valid_dl, _test_dl = [
     data.DataLoader(
         ds,
@@ -181,12 +183,112 @@ print("Defined network")
 
 # Triton
 sample_batch = next(iter(train_dl))
-mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
+# mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
+mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], 192, "gelu")
 tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
 mlp_layer_1_forward = mlp_layer_1(tmp_batch)
 
+# Test if the forward pass matches using torch
+tm = torch.matmul(tmp_batch, mlp_layer_1.weight)
+torch.allclose(mlp_layer_1_forward[:,:160], tm[:,160], rtol=1e-2, atol=1e-2)
+torch.allclose(mlp_layer_1_forward, tm, rtol=1e-2, atol=1e-2)
 
 
+# Layer comparison
+mlp_torch_layer_1 = nn.Linear(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1]).to(torch.device('cuda'))
+mlp_torch_layer_1.weight = nn.Parameter(mlp_layer_1.weight.t())
+mlp_torch_layer_1.bias = None
+mlp_torch_layer_1 = mlp_torch_layer_1.half()
+mlp_torch_layer_1_forward = mlp_torch_layer_1(tmp_batch.half())
+torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward.half())
+# FInd the number of elements in the tensor that are different by more than 0.125
+torch.sum(torch.abs(mlp_layer_1_forward - mlp_torch_layer_1_forward) > 0.125)
+
+
+
+
+# Benchmark
+configs = []
+configs.append(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],  # Argument names to use as an x-axis for the plot
+        x_vals=[16 * i for i in range(1, 10)],  # Different possible values for `x_name`
+        line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        line_vals=["cublas", "triton"],  # Label name for the lines
+        line_names=["cuBLAS", "Triton"],  # Line styles
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="TFLOPS",  # Label name for the y-axis
+        plot_name="matmul-performance-fp16",
+        args={},
+    ))
+
+
+@triton.testing.perf_report(configs)
+def benchmark(batch_size, provider):
+    train_dl, valid_dl, _test_dl = [
+        data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=(i == 0),
+            # drop_last=(i == 0),
+            num_workers=8,
+            pin_memory=True,
+        )
+        for i, ds in enumerate(dset_splits)
+    ]
+    sample_batch = next(iter(train_dl))
+    tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
+    mlp_triton_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
+    mlp_torch_layer_1 = nn.Linear(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1]).to(torch.device('cuda'))
+
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == "cublas":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda:mlp_torch_layer_1(tmp_batch), quantiles=quantiles)
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: mlp_triton_layer_1(tmp_batch), quantiles=quantiles)
+    perf = lambda ms: 2 * batch_size*320*320 * 1e-12 / (ms * 1e-3)
+
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+
+bench_out = benchmark.run(show_plots=True, print_data=True)
+# Save plots
+benchmark.save_all_plots("/home/ubuntu/Krishna-Llama/triton_benchmarks")
+
+
+do_profile = False
+if do_profile:
+    # Torch
+    writer = SummaryWriter(log_dir="/home/ubuntu/Krishna-Llama/tb_logs",
+                            flush_secs=30)
+
+    prof = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1),
+        # on_trace_ready=partial(trace_handler,
+        #                        results_dir="./profiler_logs"),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("/home/ubuntu/Krishna-Llama/tb_logs/triton_log_norm"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    )
+    prof.start()
+
+    for iter in range(100):
+        with torch.no_grad():
+            mlp_layer_1_forward = mlp_layer_1(tmp_batch)
+        # send a signal to the profiler that the next iteration has started
+        prof.step()
+        
+    prof.stop()
 # # Define logger, write configuration files and data splits
 # logger = CSVLogger(save_dir=args.out, name=args.name)
 # logger.log_hyperparams(hyperparameters.as_dict())
