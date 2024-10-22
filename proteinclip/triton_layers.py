@@ -70,9 +70,13 @@ class TritonLinearAutograd(torch.autograd.Function):
         batch_dim, in_feat_dim = flattened_inputs.shape
         _, out_feat_dim = weights.shape
 
+        requires_grad = (inputs.requires_grad or weights.requires_grad or (bias is not None and bias.requires_grad))
+        save_pre_act = requires_grad and (act_func is not None)
+
         # Create an empty torch tensor for the output
         outputs_dtype = get_output_dtype(inputs.dtype, autocast='fp16')
         outputs = torch.empty((batch_dim, out_feat_dim), dtype=outputs_dtype, device=inputs.device)
+        pre_act = torch.empty_like(outputs) if save_pre_act else outputs
 
         # Launches a 1D grid, where each program outputs blocks of
         # BLOCK_SIZE_BATCH rows and BLOCK_SIZE_OUT_FEAT columns.
@@ -91,15 +95,39 @@ class TritonLinearAutograd(torch.autograd.Function):
             fp16=outputs_dtype is torch.float16
         )
         # ctx.param = param
-        output_dtype = "fp16"
+        output_dtype = torch.float16
         ctx.act_func = act_func
         ctx.bias_requires_grad = False if bias is None else bias.requires_grad
         ctx.output_dtype = output_dtype
-        # if requires_grad:
-        #     ctx.save_for_backward(input, pre_act if save_pre_act else None, weight)
+        if requires_grad:
+            ctx.save_for_backward(inputs, pre_act if save_pre_act else None, weights)
 
         return outputs.view(*inputs.shape[:-1], out_feat_dim)
 
+
+    @staticmethod
+    def backward(
+        ctx: typing.Any,
+        output_grad: torch.Tensor,
+    ):
+        inputs, pre_act, weights = ctx.saved_tensors
+
+        flattened_inputs = inputs.flatten(0, -2)
+        batch_dim, in_feat_dim = flattened_inputs.shape
+        _, out_feat_dim = weights.shape
+
+        if ctx.act_func is None:
+            pre_act_grad = output_grad
+        # TODO: Implement the activation function
+        else:
+            pre_act_grad = output_grad
+
+        with torch.autocast("cuda", ctx.output_dtype):
+            inputs_grad = pre_act_grad @ weights.T if inputs.requires_grad else None
+            weights_grad = flattened_inputs.T @ pre_act_grad if weights.requires_grad else None
+
+        return inputs_grad.view_as(inputs), weights_grad, None, None
+        
 
 class TritonLinearLayer(nn.Linear):
     def __init__(
