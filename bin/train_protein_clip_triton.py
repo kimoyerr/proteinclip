@@ -21,6 +21,7 @@ from proteinclip import data_utils
 # from proteinclip import data_utils, fasta_utils, swissprot, hparams
 from proteinclip import contrastive
 from proteinclip import triton_layers
+from proteinclip.test_matmul import triton_matmul
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -146,7 +147,7 @@ else:
 dset_splits = [data.Subset(dset, idx) for idx in split_indices]
 
 # Create data loaders
-batch_size = 96
+batch_size = 192
 train_dl, valid_dl, _test_dl = [
     data.DataLoader(
         ds,
@@ -183,14 +184,27 @@ print("Defined network")
 
 # Triton
 sample_batch = next(iter(train_dl))
-# mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
-mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], 192, "gelu")
+mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
+# mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], 192, "gelu")
 tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
+tmp_batch.requires_grad = True
 mlp_layer_1_forward = mlp_layer_1(tmp_batch)
+
+# Testing backward
+loss = torch.sum(mlp_layer_1_forward)
+loss.backward()
+# Check the gradients
+print(tmp_batch.grad)
+print(mlp_layer_1.weight.grad)
+
+
+# Triton tutorial matmul
+# ttm = triton_matmul(tmp_batch, mlp_layer_1.weight)
+# torch.allclose(mlp_layer_1_forward.half(), ttm, atol=1e-2, rtol=1e-2)
 
 # Test if the forward pass matches using torch
 tm = torch.matmul(tmp_batch, mlp_layer_1.weight)
-torch.allclose(mlp_layer_1_forward[:,:160], tm[:,160], rtol=1e-2, atol=1e-2)
+torch.allclose(mlp_layer_1_forward[:,:160], tm[:,:160], rtol=1e-2, atol=1e-2)
 torch.allclose(mlp_layer_1_forward, tm, rtol=1e-2, atol=1e-2)
 
 
@@ -205,7 +219,10 @@ torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward.half())
 torch.sum(torch.abs(mlp_layer_1_forward - mlp_torch_layer_1_forward) > 0.125)
 
 
-
+# Tensorboard graph
+writer = SummaryWriter(log_dir="/home/ubuntu/Krishna-Llama/tb_logs",
+                            flush_secs=30)
+writer.add_graph(mlp_layer_1,tmp_batch.half())
 
 # Benchmark
 configs = []
