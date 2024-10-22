@@ -84,7 +84,7 @@ def triton_linear_forward_kernel(
     BLOCK_SIZE_BATCH:  tl.constexpr = 16,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
     BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
     BLOCK_SIZE_OUT_FEAT: tl.constexpr = 32,
-    GROUP_SIZE_BATCH: tl.constexpr = 32,
+    GROUP_SIZE_BATCH: tl.constexpr = 8,
     # Best for 320 input features
     # BLOCK_SIZE_BATCH:  tl.constexpr = 128,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
     # BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
@@ -100,11 +100,13 @@ def triton_linear_forward_kernel(
     # This code chunk groups batches and output features together for the tiled matrix multiplication: https://alvinwan.com/how-to-tile-matrix-multiplication
     ## The batch_dimension moves faster than the output feature dimension
     pids_per_group = GROUP_SIZE_BATCH * n_out_feat_pids  # Number of pids needed to cover all output features in a group. Example: If the output features are 128 and BLOCK_SIZE_OUT_FEAT is 32, and GROUP_SIZE_BATCH 4 is  then pids_per_group = 4*4 = 16
-    group_id = pid // GROUP_SIZE_BATCH
+    group_id = pid // pids_per_group  # Group id for the current pid
     first_batch_pid = group_id * GROUP_SIZE_BATCH
-    GROUP_SIZE_BATCH = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)  # Last (or the only) group may have fewer pids than GROUP_SIZE_BATCH
-    batch_pid = first_batch_pid + (pid % GROUP_SIZE_BATCH)
-    out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_BATCH  # Move to the next group of output features when all batches are covered
+    GROUP_SIZE_OUT_FEAT = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)  # Last (or the only) group may have fewer pids than GROUP_SIZE_BATCH
+    if GROUP_SIZE_OUT_FEAT < 0:
+        print("Triton Kernel: Done")
+    batch_pid = first_batch_pid + (pid % pids_per_group) % GROUP_SIZE_OUT_FEAT  # Move to the next batch when all output features are covered
+    out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_OUT_FEAT  # Move to the next group of output features when all batches are covered
 
     batch_offset = batch_pid*BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
     out_feat_offset = out_feat_pid*BLOCK_SIZE_OUT_FEAT + tl.arange(0, BLOCK_SIZE_OUT_FEAT)
