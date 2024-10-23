@@ -3,13 +3,7 @@ import triton
 import triton.language as tl
 import torch
 
-
-def allow_tf32() -> bool:
-    """
-    Returns whether the current GPU architecture supports TF32.
-    """
-    # return torch.cuda.get_device_capability()[0] >= 8
-    return False
+from proteinclip.triton_utils import allow_tf32
 
 
 # def get_n_stages(n_stages: int = 2) -> int:
@@ -70,6 +64,8 @@ def allow_tf32() -> bool:
 def triton_linear_forward_kernel(
     input_pointer,
     weight_pointer,
+    bias_pointer,
+    pre_act_pointer,
     output_pointer,
     batch_dim,
     in_feat_dim,
@@ -80,6 +76,8 @@ def triton_linear_forward_kernel(
     weight_out_feat_stride,
     output_batch_stride,
     output_out_feat_stride, 
+    param,
+    add_bias: tl.constexpr, act_func: tl.constexpr, save_pre_act: tl.constexpr,
     fp16: tl.constexpr, tf32: tl.constexpr,
     BLOCK_SIZE_BATCH:  tl.constexpr = 16,  # TODO: Change this in prod to use triton.autotune configs above that have been commented out
     BLOCK_SIZE_IN_FEAT: tl.constexpr = 64,
@@ -91,6 +89,11 @@ def triton_linear_forward_kernel(
     # BLOCK_SIZE_OUT_FEAT: tl.constexpr = 128,
     # GROUP_SIZE_BATCH: tl.constexpr = 32,
 ):
+    """
+    Triton kernel for linear forward pass.
+    Tiled matmul to reduce L2 cache miss rates by grouping batches and output features together
+    """
+
     # Print the loaded values
     # tl.device_print("Loaded values: ")
     pid = tl.program_id(0)
@@ -103,8 +106,8 @@ def triton_linear_forward_kernel(
     group_id = pid // pids_per_group  # Group id for the current pid
     first_batch_pid = group_id * GROUP_SIZE_BATCH
     GROUP_SIZE_OUT_FEAT = min(GROUP_SIZE_BATCH, n_batch_pids - first_batch_pid)  # Last (or the only) group may have fewer pids than GROUP_SIZE_BATCH
-    if GROUP_SIZE_OUT_FEAT < 0:
-        print("Triton Kernel: Done")
+    # if GROUP_SIZE_OUT_FEAT < 0:
+    #     print("Triton Kernel: Done")
     batch_pid = first_batch_pid + (pid % pids_per_group) % GROUP_SIZE_OUT_FEAT  # Move to the next batch when all output features are covered
     out_feat_pid = (pid % pids_per_group) // GROUP_SIZE_OUT_FEAT  # Move to the next group of output features when all batches are covered
 
@@ -117,7 +120,6 @@ def triton_linear_forward_kernel(
 
     input_pointer += input_batch_stride*batch_offset[:, None]
     weight_pointer += weight_out_feat_stride*out_feat_offset[None, :]
-
 
     # Run inner dimension loop for each block
     accum = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_OUT_FEAT),
@@ -144,14 +146,14 @@ def triton_linear_forward_kernel(
 
         accum += tl.dot(input_block, weight_block, allow_tf32=tf32)
 
-    # if add_bias:
-    #     bias = tl.load(bias_pointer + out_feat_offset,
-    #                    mask=out_feat_mask)
+    if add_bias:
+        bias = tl.load(bias_pointer + out_feat_offset,
+                       mask=out_feat_mask)
 
-    #     if fp16:
-    #         bias = bias.to(tl.float16)
+        if fp16:
+            bias = bias.to(tl.float16)
 
-    #     accum += bias[None, :]
+        accum += bias[None, :]
 
     # if act_func is not None:
     #     if save_pre_act:
@@ -166,8 +168,6 @@ def triton_linear_forward_kernel(
                        output_out_feat_stride * out_feat_offset[None, :])
     tl.store(output_pointer, accum,
              mask=batch_mask[:, None] & out_feat_mask[None, :])
-
-    print("Triton Kernel: Done")
 
 
 
