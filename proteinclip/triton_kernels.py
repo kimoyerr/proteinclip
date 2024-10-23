@@ -74,6 +74,8 @@ def triton_linear_forward_kernel(
     input_in_feat_stride,
     weight_in_feat_stride,
     weight_out_feat_stride,
+    pre_act_batch_stride,
+    pre_act_out_feat_stride,
     output_batch_stride,
     output_out_feat_stride, 
     param,
