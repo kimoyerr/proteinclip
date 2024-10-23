@@ -1,52 +1,17 @@
-import os
-
+# Inspired from https://github.com/BobMcDear/attorch/blob/main/attorch/linear_layer.py
 import typing
 import torch
 from torch import nn
-import triton
 from triton import cdiv
 
 from proteinclip import triton_kernels
-
-
-def get_output_dtype(
-    input_dtype: torch.dtype = torch.float32,
-    autocast: typing.Optional[str] = None,
-    ) -> torch.dtype:
-    """
-    Returns the appropriate output dtype for automatic mixed precision
-    given the input dtype and the operation's autocast behaviour.
-
-    Args:
-        input_dtype: Input dtype.
-        autocast: The relevent operation's autocast behaviour.
-            None signifies the input dtype should flow through,
-            'fp16' signifies autocasting to FP16 when AMP is enabled,
-            and 'fp32' signifies autocasting to FP32 when AMP is enabled.
-    """
-    dtype = torch.get_autocast_dtype('cuda')
-    assert dtype, \
-        f'Only autocast to float16 is supported, received {dtype}'
-
-    if torch.is_autocast_enabled():
-        if autocast is None:
-            return input_dtype
-
-        elif autocast == 'fp16':
-            return torch.float16
-
-        elif autocast == 'fp32':
-            return torch.float32
-
-        else:
-            raise RuntimeError(f'Autocast type {autocast} is invalid. '
-                               'Options are None, fp16, and fp32')
-
-    else:
-        return input_dtype
+from proteinclip.triton_utils import get_output_dtype
 
 
 class TritonLinearAutograd(torch.autograd.Function):
+    """
+    Custom autograd function for linear layer using Triton kernels
+    """
     @staticmethod
     def forward(
         ctx: typing.Any,
@@ -55,8 +20,21 @@ class TritonLinearAutograd(torch.autograd.Function):
         bias: typing.Optional[torch.Tensor] = None,
         act_func: typing.Optional[str] = None,  
     ) -> torch.Tensor:
+        """
+        Linearly transforms the input using weights, optionally adding bias and fusing an activation function.
+        """
+
+        # Assert that the weights are 2D
+        assert weights.ndim == 2, f'Weights must be 2D, received shape {weights.shape}'
+        # Assert that the bias is 1D
+        assert bias is None or bias.ndim == 1, f'Bias must be 1D, received shape {bias.shape}'
+        # Assert that the input and weights are compatible
+        assert inputs.shape[-1] == weights.shape[0], f'Incompatible input ({inputs.shape}) and weights ({weights.shape}) shape'
+        # Assert that the weights and bias are compatible
+        assert bias is None or weights.shape[1] == bias.shape[0], f'Incompatible weights ({weights.shape}) and bias ({bias.shape}) shape'
         
         # IF actiavtion function is None, set it to 'gelu'
+        param = None
         if act_func is None:
             act_func = 'gelu'
 
@@ -64,13 +42,13 @@ class TritonLinearAutograd(torch.autograd.Function):
         if weights is None:
             raise ValueError("Weights must be provided")
 
-        # print(inputs.shape)
 
         flattened_inputs = inputs.flatten(0, -2)
         batch_dim, in_feat_dim = flattened_inputs.shape
         _, out_feat_dim = weights.shape
 
         requires_grad = (inputs.requires_grad or weights.requires_grad or (bias is not None and bias.requires_grad))
+        # Only save pre-activation if we need to backprop through the activation function
         save_pre_act = requires_grad and (act_func is not None)
 
         # Create an empty torch tensor for the output
@@ -85,20 +63,28 @@ class TritonLinearAutograd(torch.autograd.Function):
         triton_kernels.triton_linear_forward_kernel[grid](
             flattened_inputs, 
             weights, 
+            inputs if bias is None else bias,
+            pre_act,
             outputs,
             batch_dim, 
             in_feat_dim, 
             out_feat_dim,
             *flattened_inputs.stride(),
             *weights.stride(),
+            *pre_act.stride(),
             *outputs.stride(),
+            param,
+            add_bias=bias is not None,
+            act_func=act_func,
+            save_pre_act=save_pre_act,
             fp16=outputs_dtype is torch.float16
         )
-        # ctx.param = param
-        output_dtype = torch.float16
+        
+        # Save the context
+        ctx.param = param
         ctx.act_func = act_func
         ctx.bias_requires_grad = False if bias is None else bias.requires_grad
-        ctx.output_dtype = output_dtype
+        ctx.outputs_dtype = outputs_dtype
         if requires_grad:
             ctx.save_for_backward(inputs, pre_act if save_pre_act else None, weights)
 
