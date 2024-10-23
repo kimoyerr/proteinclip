@@ -3,6 +3,12 @@
 import typing
 import torch
 
+def allow_tf32() -> bool:
+    """
+    Returns whether the current GPU architecture supports TF32.
+    """
+    return torch.cuda.get_device_capability()[0] >= 8
+
 
 def get_output_dtype(
     input_dtype: torch.dtype = torch.float32,
