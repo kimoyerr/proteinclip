@@ -90,29 +90,36 @@ class TritonLinearAutograd(torch.autograd.Function):
 
         return outputs.view(*inputs.shape[:-1], out_feat_dim)
 
-
     @staticmethod
     def backward(
         ctx: typing.Any,
-        output_grad: torch.Tensor,
-    ):
+        outputs_grad: torch.Tensor,
+    ) -> typing.Tuple[typing.Optional[torch.Tensor], ...]:
+        """
+        Backward pass for the linear layer
+        """
+
         inputs, pre_act, weights = ctx.saved_tensors
 
+        outputs_grad = outputs_grad.flatten(0, -2)
         flattened_inputs = inputs.flatten(0, -2)
         batch_dim, in_feat_dim = flattened_inputs.shape
         _, out_feat_dim = weights.shape
 
         if ctx.act_func is None:
-            pre_act_grad = output_grad
+            pre_act_grad = outputs_grad
         # TODO: Implement the activation function
         else:
-            pre_act_grad = output_grad
+            pre_act_grad = outputs_grad
 
-        with torch.autocast("cuda", ctx.output_dtype):
+        # TODO: Use the Triton forward kernel to calculate the gradients instead of torch matmul
+        with torch.autocast("cuda", ctx.outputs_dtype):
             inputs_grad = pre_act_grad @ weights.T if inputs.requires_grad else None
             weights_grad = flattened_inputs.T @ pre_act_grad if weights.requires_grad else None
+        bias_grad = pre_act_grad.sum(dim=0) if ctx.bias_requires_grad else None
 
-        return inputs_grad.view_as(inputs), weights_grad, None, None
+        # pads outputs with None for the act_func since all inputs to the layer must have gradients
+        return (inputs_grad.view_as(inputs) if inputs_grad is not None else None, weights_grad, bias_grad, None)
         
 
 class TritonLinearLayer(nn.Linear):
