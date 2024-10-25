@@ -2,7 +2,7 @@
 import os
 
 # Triton debug options: Change to 1 to enable debugging and change to 0 to disable debugging
-os.environ['TRITON_INTERPRET'] = '1'
+os.environ['TRITON_INTERPRET'] = '0'
 # This has to be before importing triton
 ############################################################################################################################
 
@@ -184,8 +184,7 @@ print("Defined network")
 
 # Triton
 sample_batch = next(iter(train_dl))
-mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu")
-# mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], 192, "gelu")
+mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu", bias=False)
 tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
 tmp_batch.requires_grad = True
 mlp_layer_1_forward = mlp_layer_1(tmp_batch)
@@ -197,14 +196,8 @@ loss.backward()
 print(tmp_batch.grad)
 print(mlp_layer_1.weight.grad)
 
-
-# Triton tutorial matmul
-# ttm = triton_matmul(tmp_batch, mlp_layer_1.weight)
-# torch.allclose(mlp_layer_1_forward.half(), ttm, atol=1e-2, rtol=1e-2)
-
 # Test if the forward pass matches using torch
 tm = torch.matmul(tmp_batch, mlp_layer_1.weight)
-torch.allclose(mlp_layer_1_forward[:,:160], tm[:,:160], rtol=1e-2, atol=1e-2)
 torch.allclose(mlp_layer_1_forward, tm, rtol=1e-2, atol=1e-2)
 
 
