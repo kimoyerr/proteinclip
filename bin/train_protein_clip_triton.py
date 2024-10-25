@@ -211,11 +211,10 @@ torch.allclose(mlp_layer_1_forward, tm, rtol=1e-2, atol=1e-2)
 mlp_torch_layer_1 = nn.Linear(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1]).to(torch.device('cuda'))
 mlp_torch_layer_1.weight = nn.Parameter(mlp_layer_1.weight.t())
 mlp_torch_layer_1.bias = None
-mlp_torch_layer_1 = mlp_torch_layer_1.half()
-mlp_torch_layer_1_forward = mlp_torch_layer_1(tmp_batch.half())
-torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward.half())
-# FInd the number of elements in the tensor that are different by more than 0.125
-torch.sum(torch.abs(mlp_layer_1_forward - mlp_torch_layer_1_forward) > 0.125)
+mlp_torch_layer_1_forward = mlp_torch_layer_1(tmp_batch)
+# Gelu
+mlp_torch_layer_1_forward = nn.functional.gelu(mlp_torch_layer_1_forward)
+torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward, rtol=1e-2, atol=1e-2)
 
 
 # Tensorboard graph
