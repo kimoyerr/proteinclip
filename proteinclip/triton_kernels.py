@@ -4,6 +4,7 @@ import triton.language as tl
 import torch
 
 from proteinclip.triton_utils import allow_tf32
+from proteinclip.triton_activations import apply_act_func
 
 
 # def get_n_stages(n_stages: int = 2) -> int:
@@ -157,14 +158,14 @@ def triton_linear_forward_kernel(
 
         accum += bias[None, :]
 
-    # if act_func is not None:
-    #     if save_pre_act:
-    #         pre_act_pointer += (pre_act_batch_stride * batch_offset[:, None] +
-    #                             pre_act_out_feat_stride * out_feat_offset[None, :])
-    #         tl.store(pre_act_pointer, accum,
-    #                  mask=batch_mask[:, None] & out_feat_mask[None, :])
+    if act_func is not None:
+        if save_pre_act:
+            pre_act_pointer += (pre_act_batch_stride * batch_offset[:, None] +
+                                pre_act_out_feat_stride * out_feat_offset[None, :])
+            tl.store(pre_act_pointer, accum,
+                     mask=batch_mask[:, None] & out_feat_mask[None, :])
 
-    #     accum = apply_act_func(accum, None, None, None, param, act_func, False)
+        accum = apply_act_func(accum, act_func)
 
     output_pointer += (output_batch_stride * batch_offset[:, None] +
                        output_out_feat_stride * out_feat_offset[None, :])

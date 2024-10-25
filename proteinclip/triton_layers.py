@@ -4,9 +4,8 @@ import torch
 from torch import nn
 from triton import cdiv
 
-from proteinclip import triton_kernels
+from proteinclip import triton_kernels, triton_activations
 from proteinclip.triton_utils import get_output_dtype
-
 
 class TritonLinearAutograd(torch.autograd.Function):
     """
@@ -41,7 +40,6 @@ class TritonLinearAutograd(torch.autograd.Function):
         # If weights are None, throw an error
         if weights is None:
             raise ValueError("Weights must be provided")
-
 
         flattened_inputs = inputs.flatten(0, -2)
         batch_dim, in_feat_dim = flattened_inputs.shape
@@ -108,9 +106,18 @@ class TritonLinearAutograd(torch.autograd.Function):
 
         if ctx.act_func is None:
             pre_act_grad = outputs_grad
-        # TODO: Implement the activation function
         else:
-            pre_act_grad = outputs_grad
+            size = batch_dim * out_feat_dim
+            pre_act_grad = torch.empty(size, dtype=pre_act.dtype, device=pre_act.device)
+            grid = lambda META: (cdiv(size, META['BLOCK_SIZE']),)
+            triton_activations.act_func_backward_kernel[grid](
+                outputs_grad, 
+                pre_act, 
+                pre_act_grad, 
+                size,
+                ctx.act_func,
+            )
+            pre_act_grad = pre_act_grad.view_as(pre_act)
 
         # TODO: Use the Triton forward kernel to calculate the gradients instead of torch matmul
         with torch.autocast("cuda", ctx.outputs_dtype):
@@ -141,6 +148,9 @@ class TritonLinearLayer(nn.Linear):
             nonlinearity = "relu"
         else:
             nonlinearity = self.act_func
+        
+        if self.act_func is None:
+            nonlinearity = "linear"
 
         torch.nn.init.kaiming_normal_(self.weight, nonlinearity=nonlinearity, mode='fan_in')
 
