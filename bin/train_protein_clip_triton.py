@@ -196,7 +196,7 @@ mlp_layer_1_forward = mlp_layer_1(tmp_batch)
 mlp_layer_1_shared_forward = mlp_layer_1_shared(mlp_layer_1_forward)
 
 # Testing backward
-loss = torch.sum(mlp_layer_1_forward)
+loss = torch.sum(mlp_layer_1_shared_forward)
 loss.backward()
 # Check the gradients
 print(tmp_batch.grad)
@@ -214,7 +214,25 @@ mlp_torch_layer_1.bias = None
 mlp_torch_layer_1_forward = mlp_torch_layer_1(tmp_batch)
 # Gelu
 mlp_torch_layer_1_forward = nn.functional.gelu(mlp_torch_layer_1_forward)
-torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward, rtol=1e-2, atol=1e-2)
+# Check
+assert torch.allclose(mlp_layer_1_forward, mlp_torch_layer_1_forward, rtol=1e-2, atol=1e-2)
+
+# Shared layer
+mlp_torch_layer_1_shared = nn.Linear(sample_batch["x_1"].shape[-1], mlp_dim).to(torch.device('cuda'))
+mlp_torch_layer_1_shared.weight = nn.Parameter(mlp_layer_1_shared.weight.t())
+mlp_torch_layer_1_shared.bias = None
+mlp_torch_layer_1_shared_forward = mlp_torch_layer_1_shared(mlp_torch_layer_1_forward)
+# mlp_torch_layer_1_shared_forward = nn.functional.gelu(mlp_torch_layer_1_shared_forward)
+# Check
+assert torch.allclose(mlp_layer_1_shared_forward, mlp_torch_layer_1_shared_forward, rtol=1e-2, atol=1e-2)
+
+torch_loss = torch.sum(mlp_torch_layer_1_shared_forward)
+torch_loss.backward()
+
+# Check the gradients
+assert torch.allclose(mlp_torch_layer_1_shared.weight.grad.t(), mlp_layer_1_shared.weight.grad, rtol=1e-2, atol=1e-2)
+assert torch.allclose(mlp_torch_layer_1.weight.grad.t(), mlp_layer_1.weight.grad, rtol=1e-2, atol=1e-2)
+
 
 
 # Tensorboard graph
