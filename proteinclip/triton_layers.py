@@ -34,8 +34,6 @@ class TritonLinearAutograd(torch.autograd.Function):
         
         # IF actiavtion function is None, set it to 'gelu'
         param = None
-        if act_func is None:
-            act_func = 'gelu'
 
         # If weights are None, throw an error
         if weights is None:
