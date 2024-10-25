@@ -40,9 +40,13 @@ def write_split_identifiers(train_ids, valid_ids, test_ids, out_file):
         )
 
 
+# Set random seeds
+seed = 42
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+
 
 # Training
-
 # Local zenodo dir in the current file's grandparent directory
 local_zenodo_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "zenodo")
 # Make zenodo dir if it does not exist
@@ -185,9 +189,11 @@ print("Defined network")
 # Triton
 sample_batch = next(iter(train_dl))
 mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu", bias=False)
+mlp_layer_1_shared = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], mlp_dim, None, bias=False)
 tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
 tmp_batch.requires_grad = True
 mlp_layer_1_forward = mlp_layer_1(tmp_batch)
+mlp_layer_1_shared_forward = mlp_layer_1_shared(mlp_layer_1_forward)
 
 # Testing backward
 loss = torch.sum(mlp_layer_1_forward)
