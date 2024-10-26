@@ -1,7 +1,32 @@
 # Inspired by https://github.com/BobMcDear/attorch/blob/main/attorch/utils.py
 
+from typing import Dict, List
 import typing
 import torch
+import triton
+from triton import next_power_of_2
+
+
+def BLOCK_SIZE_BATCH_heuristic(args: Dict) -> int:
+    """
+    Approximates an appropriate batch block size for softmax using a heuristic.
+
+    Args:
+        args: Arguments to softmax kernel.
+
+    Returns:
+        Appropriate batch block size.
+    """
+    # This heuristic was derived manually.
+    # Essentially, if the batch dimension is greater than 1024,
+    # for small feature sizes (less than 64), it is much more efficient
+    # to process multiple rows at once in a given program.
+    # Specifically, each time the number of samples is doubled,
+    # the block size across the batch dimension should be doubled too,
+    # with an upper bound of 128.
+    return (min(max(1, next_power_of_2(args['batch_dim'] // 2 ** 10)), 128)
+            if args['feat_dim'] < 64 else 1)
+
 
 def allow_tf32() -> bool:
     """
@@ -45,3 +70,10 @@ def get_output_dtype(
 
     else:
         return input_dtype
+
+
+def warps_kernel_configs() -> List[triton.Config]:
+    """
+    Returns kernel configurations with all possible number of warps.
+    """
+    return [triton.Config({}, num_warps=2**i) for i in range(6)]
