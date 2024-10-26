@@ -2,10 +2,14 @@
 import os
 
 # Triton debug options: Change to 1 to enable debugging and change to 0 to disable debugging
-os.environ['TRITON_INTERPRET'] = '0'
+debug = False
+if debug:
+    os.environ['TRITON_INTERPRET'] = '1'
+else:
+    os.environ['TRITON_INTERPRET'] = '0'
+
 # This has to be before importing triton
 ############################################################################################################################
-
 
 import json
 import argparse
@@ -14,16 +18,18 @@ import logging
 import torch
 from torch import nn
 from torch.utils import data
+from torch.nn import functional as F
 import triton
 
 from proteinclip import data_utils
 
 # from proteinclip import data_utils, fasta_utils, swissprot, hparams
 from proteinclip import contrastive
-from proteinclip import triton_layers
+from proteinclip import triton_layers, triton_layer_norm_layer
 from proteinclip.test_matmul import triton_matmul
 
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 
 def write_split_identifiers(train_ids, valid_ids, test_ids, out_file):
@@ -101,7 +107,8 @@ shared_keys = sorted(set(esm_embeddings.mapping.keys()).intersection(sp_text_emb
 print(f"Number of shared keys: {len(shared_keys)}")
 
 # Subset some pairs randomly for debugging
-shared_keys = shared_keys[:1000]
+if debug:
+    shared_keys = shared_keys[:1000]
 
 do_per_token = False
 do_unit_norm = True
@@ -171,29 +178,84 @@ mlp_n_hidden = 1
 lr = 1e-4
 input_dim_1 = next(iter(train_dl))["x_1"].shape[-1]
 input_dim_2 = next(iter(train_dl))["x_2"].shape[-1]
-model_class = (
-    contrastive.ContrastiveEmbeddingWithPreprocessor
-    if do_per_token
-    else contrastive.ContrastiveEmbedding
-)
-net = model_class(
-    input_dim_1=input_dim_1,
-    input_dim_2=input_dim_2,
-    shared_dim=mlp_dim,
-    num_hidden=mlp_n_hidden,
-    lr=lr,
-)
+# model_class = (
+#     contrastive.ContrastiveEmbeddingWithPreprocessor
+#     if do_per_token
+#     else contrastive.ContrastiveEmbedding
+# )
+# net = model_class(
+#     input_dim_1=input_dim_1,
+#     input_dim_2=input_dim_2,
+#     shared_dim=mlp_dim,
+#     num_hidden=mlp_n_hidden,
+#     lr=lr,
+# )
 print("Defined network")
 
 
-# Triton
-sample_batch = next(iter(train_dl))
-mlp_layer_1 = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], sample_batch["x_1"].shape[-1], "gelu", bias=False)
-mlp_layer_1_shared = triton_layers.TritonLinearLayer(sample_batch["x_1"].shape[-1], mlp_dim, None, bias=False)
-tmp_batch = sample_batch["x_1"].to(torch.device('cuda'))
-tmp_batch.requires_grad = True
-mlp_layer_1_forward = mlp_layer_1(tmp_batch)
-mlp_layer_1_shared_forward = mlp_layer_1_shared(mlp_layer_1_forward)
+# Create a model using Triton
+class ContrastiveEmbeddingTriton(torch.nn.Module):
+    def __init__(self, input_dim_1, input_dim_2, shared_dim):
+        super(ContrastiveEmbeddingTriton, self).__init__()
+        self.mlp_layer_1 = triton_layers.TritonLinearLayer(input_dim_1, input_dim_1, "gelu", bias=False)
+        self.mlp_layer_1_shared = triton_layers.TritonLinearLayer(input_dim_1, shared_dim, None, bias=False)
+        self.mlp_layer_1_norm = triton_layer_norm_layer.LayerNorm(input_dim_1, elementwise_affine=True)
+        self.mlp_layer_2 = triton_layers.TritonLinearLayer(input_dim_2, input_dim_2, "gelu", bias=False)
+        self.mlp_layer_2_shared = triton_layers.TritonLinearLayer(input_dim_2, shared_dim, None, bias=False)
+        self.mlp_layer_2_norm = triton_layer_norm_layer.LayerNorm(input_dim_2, elementwise_affine=True)
+    
+    def forward(self, batch):
+        # Mode 1
+        mlp_layer_1_forward = self.mlp_layer_1(batch["x_1"])
+        mlp_layer_1_forward_norm = self.mlp_layer_1_norm(mlp_layer_1_forward)
+        x1_proj = self.mlp_layer_1_shared(mlp_layer_1_forward_norm)
+        # Mode 2
+        mlp_layer_2_forward = self.mlp_layer_2(batch["x_2"])
+        mlp_layer_2_forward_norm = self.mlp_layer_2_norm(mlp_layer_2_forward)
+        x2_proj = self.mlp_layer_2_shared(mlp_layer_2_forward_norm)
+        return x1_proj, x2_proj
+
+
+# Instantiate the model
+custom_net = ContrastiveEmbeddingTriton(input_dim_1, input_dim_2, mlp_dim)
+
+
+# Train loop over epochs and batches
+lr = 0.001
+optimizer = torch.optim.Adam(custom_net.parameters(), lr=lr)
+checkpoint_dir = "/home/ubuntu/Krishna-Llama/proteinclip/checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+num_epochs = 10
+for epoch in range(num_epochs):
+    # Go over train_dl
+    for batch_index, batch in enumerate(tqdm(train_dl, desc="Training Epoch")):
+
+        # Forward pass
+        batch = {k: v.to(torch.device('cuda')) for k, v in batch.items()}
+        x1_proj, x2_proj = custom_net(batch)
+        
+        # Loss
+        optimizer.zero_grad()
+        temperature = nn.Parameter(data=torch.Tensor([1.0]), requires_grad=True).to(x1_proj.device)
+        logits = x1_proj @ x2_proj.T * torch.exp(temperature)
+        labels = torch.arange(x1_proj.shape[0]).to(logits.device)
+        l_1 = F.cross_entropy(logits, labels)
+        l_2 = F.cross_entropy(logits.T, labels)
+        loss = (l_1 + l_2) / 2
+
+        # Backward pass and step
+        loss.backward()
+        optimizer.step()
+
+        # Log loss
+        if batch_index % 10 == 0:
+            print(f"Epoch: {epoch}, Batch: {batch_index}, Loss: {loss.item()}")
+        
+    # Save checkpoint
+    torch.save(custom_net.state_dict(), os.path.join(checkpoint_dir, f"checkpoint_{epoch}.pt"))
+    
+
+
 
 # Testing backward
 loss = torch.sum(mlp_layer_1_shared_forward)
