@@ -24,9 +24,8 @@ import triton
 from proteinclip import data_utils
 
 # from proteinclip import data_utils, fasta_utils, swissprot, hparams
-from proteinclip import contrastive
-from proteinclip import triton_layers, triton_layer_norm_layer
-from proteinclip.test_matmul import triton_matmul
+from proteinclip import triton_layers
+from proteinclip.triton_model import ContrastiveEmbeddingTriton
 
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -158,7 +157,7 @@ else:
 dset_splits = [data.Subset(dset, idx) for idx in split_indices]
 
 # Create data loaders
-batch_size = 192
+batch_size = 512
 train_dl, valid_dl, _test_dl = [
     data.DataLoader(
         ds,
@@ -178,45 +177,9 @@ mlp_n_hidden = 1
 lr = 1e-4
 input_dim_1 = next(iter(train_dl))["x_1"].shape[-1]
 input_dim_2 = next(iter(train_dl))["x_2"].shape[-1]
-# model_class = (
-#     contrastive.ContrastiveEmbeddingWithPreprocessor
-#     if do_per_token
-#     else contrastive.ContrastiveEmbedding
-# )
-# net = model_class(
-#     input_dim_1=input_dim_1,
-#     input_dim_2=input_dim_2,
-#     shared_dim=mlp_dim,
-#     num_hidden=mlp_n_hidden,
-#     lr=lr,
-# )
-print("Defined network")
 
 
 # Create a model using Triton
-class ContrastiveEmbeddingTriton(torch.nn.Module):
-    def __init__(self, input_dim_1, input_dim_2, shared_dim):
-        super(ContrastiveEmbeddingTriton, self).__init__()
-        self.mlp_layer_1 = triton_layers.TritonLinearLayer(input_dim_1, input_dim_1, "gelu", bias=False)
-        self.mlp_layer_1_shared = triton_layers.TritonLinearLayer(input_dim_1, shared_dim, None, bias=False)
-        self.mlp_layer_1_norm = triton_layer_norm_layer.LayerNorm(input_dim_1, elementwise_affine=True)
-        self.mlp_layer_2 = triton_layers.TritonLinearLayer(input_dim_2, input_dim_2, "gelu", bias=False)
-        self.mlp_layer_2_shared = triton_layers.TritonLinearLayer(input_dim_2, shared_dim, None, bias=False)
-        self.mlp_layer_2_norm = triton_layer_norm_layer.LayerNorm(input_dim_2, elementwise_affine=True)
-    
-    def forward(self, batch):
-        # Mode 1
-        mlp_layer_1_forward = self.mlp_layer_1(batch["x_1"])
-        mlp_layer_1_forward_norm = self.mlp_layer_1_norm(mlp_layer_1_forward)
-        x1_proj = self.mlp_layer_1_shared(mlp_layer_1_forward_norm)
-        # Mode 2
-        mlp_layer_2_forward = self.mlp_layer_2(batch["x_2"])
-        mlp_layer_2_forward_norm = self.mlp_layer_2_norm(mlp_layer_2_forward)
-        x2_proj = self.mlp_layer_2_shared(mlp_layer_2_forward_norm)
-        return x1_proj, x2_proj
-
-
-# Instantiate the model
 custom_net = ContrastiveEmbeddingTriton(input_dim_1, input_dim_2, mlp_dim)
 
 
@@ -253,21 +216,6 @@ for epoch in range(num_epochs):
         
     # Save checkpoint
     torch.save(custom_net.state_dict(), os.path.join(checkpoint_dir, f"checkpoint_{epoch}.pt"))
-    
-
-
-
-# Testing backward
-loss = torch.sum(mlp_layer_1_shared_forward)
-loss.backward()
-# Check the gradients
-print(tmp_batch.grad)
-print(mlp_layer_1.weight.grad)
-
-# Test if the forward pass matches using torch
-tm = torch.matmul(tmp_batch, mlp_layer_1.weight)
-torch.allclose(mlp_layer_1_forward, tm, rtol=1e-2, atol=1e-2)
-
 
 
 
@@ -325,73 +273,4 @@ bench_out = benchmark.run(show_plots=True, print_data=True)
 # Save plots
 benchmark.save_all_plots("/home/ubuntu/Krishna-Llama/triton_benchmarks")
 
-
-do_profile = False
-if do_profile:
-    # Torch
-    writer = SummaryWriter(log_dir="/home/ubuntu/Krishna-Llama/tb_logs",
-                            flush_secs=30)
-
-    prof = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=1,
-            warmup=1,
-            active=3,
-            repeat=1),
-        # on_trace_ready=partial(trace_handler,
-        #                        results_dir="./profiler_logs"),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("/home/ubuntu/Krishna-Llama/tb_logs/triton_log_norm"),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    )
-    prof.start()
-
-    for iter in range(100):
-        with torch.no_grad():
-            mlp_layer_1_forward = mlp_layer_1(tmp_batch)
-        # send a signal to the profiler that the next iteration has started
-        prof.step()
-        
-    prof.stop()
-# # Define logger, write configuration files and data splits
-# logger = CSVLogger(save_dir=args.out, name=args.name)
-# logger.log_hyperparams(hyperparameters.as_dict())
-# write_split_identifiers(
-#     train_ids=[dset.pairs[i] for i in split_indices[0]],
-#     valid_ids=[dset.pairs[i] for i in split_indices[1]],
-#     test_ids=[dset.pairs[i] for i in split_indices[2]],
-#     out_file=os.path.join(logger.log_dir, "data_splits.json"),
-# )
-# net.write_config_json(os.path.join(logger.log_dir, "model_config.json"))
-# with open(os.path.join(logger.log_dir, "training_config.json"), "w") as sink:
-#     json.dump(vars(args), sink, indent=4)
-
-# # Train
-# trainer = pl.Trainer(
-#     max_epochs=hyperparameters.max_epochs,
-#     accelerator="cuda",
-#     devices=args.gpu,
-#     enable_progress_bar=True,
-#     logger=logger,
-#     log_every_n_steps=10,
-#     deterministic=True,
-# )
-# trainer.fit(net, train_dataloaders=train_dl, val_dataloaders=valid_dl)
-
-# # Export model as ONNX files
-# contrastive.model_to_onnx(
-#     net.project_1,
-#     os.path.join(logger.log_dir, "project_1.onnx"),
-#     input_shape=(input_dim_1,),
-# )
-# contrastive.model_to_onnx(
-#     net.project_2,
-#     os.path.join(logger.log_dir, "project_2.onnx"),
-#     input_shape=(input_dim_2,),
-# )
 
